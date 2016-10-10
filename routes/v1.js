@@ -1,23 +1,18 @@
 'use strict';
 
-
-var BBPromise = require('bluebird');
-var preq = require('preq');
-var sUtil = require('../lib/util');
-var _ = require('lodash');
-
+const _          = require('lodash');
+const sse        = require('sse');
+const sUtil      = require('../lib/util');
 const kafkaUtils = require('../lib/kafka-util');
-const sse   = require('sse');
 
 
 // shortcut
-var HTTPError = sUtil.HTTPError;
-
+const HTTPError = sUtil.HTTPError;
 
 /**
  * The main router object
  */
-var router = sUtil.router();
+const router = sUtil.router();
 
 /**
  * The main application object reported when this module is require()d
