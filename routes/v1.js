@@ -1,20 +1,18 @@
 'use strict';
 
+const _          = require('lodash');
+const sse        = require('sse');
+const sUtil      = require('../lib/util');
+const kafkaUtils = require('../lib/kafka-util');
 
-var BBPromise = require('bluebird');
-var preq = require('preq');
-var domino = require('domino');
-var sUtil = require('../lib/util');
-var apiUtil = require('../lib/api-util');
 
 // shortcut
-var HTTPError = sUtil.HTTPError;
-
+const HTTPError = sUtil.HTTPError;
 
 /**
  * The main router object
  */
-var router = sUtil.router();
+const router = sUtil.router();
 
 /**
  * The main application object reported when this module is require()d
@@ -22,141 +20,191 @@ var router = sUtil.router();
 var app;
 
 
-/**
- * GET /siteinfo{/prop}
- * Fetches site info for the given domain, optionally
- * returning only the specified property. This example shows how to:
- * 1) use named URI parameters (by prefixing them with a colon)
- * 2) use optional URI parameters (by suffixing them with a question mark)
- * 3) extract URI parameters
- * 4) issue external requests
- * 5) use Promises to achieve (4) and return the result
- *
- * For more info about routing see http://expressjs.com/guide/routing.html
- *
- * There are multiple ways of calling this endpoint:
- * 1) GET /{domain}/v1/siteinfo/
- * 2) GET /{domain}/v1/siteinfo/mainpage (or other props available in
- *      the general siprop, as supported by MWAPI)
- */
-router.get('/siteinfo/:prop?', function(req, res) {
+router.get('/:topics', function(req, res) {
+    // This object maps topic/partition to an object
+    // suitable for passing to kafkaConsumer.assign.
+    // We need to keep it as an object so we can keep track of
+    // the latest offset sent to the client for a given topic partition.
+    let latestOffsetsMap    = {};
 
-    // construct the query for the MW Action API
-    var apiQuery = {
-        format: 'json',
-        action: 'query',
-        meta: 'siteinfo',
-        continue: ''
+    // The KafkaConsumer instance for this request.
+    let kafkaConsumer       = undefined;
+
+    // The sseClient instance for this request.
+    let sseClient           = undefined;
+
+
+    // Default kafkaConfigs to use if not provided in kafkaConfig.
+    const defaultKafkaConfig = {
+        'metadata.broker.list': 'localhost:9092',
+        'client.id': `eventstreams-${req.headers['x-request-id']}`
     };
 
-    // send it
-    return apiUtil.mwApiGet(app, req.params.domain, apiQuery)
-    // and then return the result to the caller
-    .then(function(apiRes) {
-        // do we have to return only one prop?
-        if(req.params.prop) {
-            // check it exists in the response body
-            if(apiRes.body.query.general[req.params.prop] === undefined) {
-                // nope, error out
+    // These configs MUST be set for an eventstreams KafkaConsumer.
+    // The are not overridable.
+    // We want to avoid making Kafka manage consumer info
+    // for http clients.
+    //   A. no offset commits
+    //   B. no consumer group management/balancing.
+    // A. is achieved simply by setting enable.auto.commit: false.
+    // B. is more complicated. Until
+    // https://github.com/edenhill/librdkafka/issues/593 is resolved,
+    // there is no way to 100% keep Kafka from managing clients.  So,
+    // we fake it by using the socket name, which will be unique
+    // for each socket instance.  Since we use assign() instead of
+    // subscribe(), at least we don't have to deal with any rebalance
+    // callbacks.
+    const mandatoryKafkaConfig = {
+        'enable.auto.commit': false,
+        'group.id': `eventstreams-${req.headers['x-request-id']}`
+    };
+
+    // Merge provided app.conf.kafka config default configs, and mandatory over all
+    const kafkaConfig = Object.assign(
+        defaultKafkaConfig,
+        app.conf.kafka,
+        mandatoryKafkaConfig
+    )
+
+    // Create and connect the promisified KafkaConsumer
+    kafkaUtils.createKafkaConsumerAsync(kafkaConfig)
+
+    // Set the kafkaConsumer for future then blocks
+    // and close the consumer when the client disconnects;
+    .then(consumer => {
+        kafkaConsumer = consumer;
+        req.on('close', function() {
+            req.logger.log('info/eventstreams', `Closing KafkaConsumer ${kafkaConfig['client.id']}`);
+            // TODO fix disconnect node-rdkafka bug
+            kafkaConsumer.disconnect();
+        });
+    })
+
+
+    // Build Kafka assignments from last-event-id or topics URI parameter.
+    // last-event-id takes precidence;  topics param will be ignored
+    // if last-event-id header is set.
+    .then(() => {
+        let assignments = undefined;
+
+        // Build assignments from last-event-id header if it is set.
+        if ('last-event-id' in req.headers) {
+            try {
+                assignments = JSON.parse(req.headers['last-event-id']);
+            }
+            catch (e) {
                 throw new HTTPError({
-                    status: 404,
-                    type: 'not_found',
-                    title: 'No such property',
-                    detail: 'Property ' + req.params.prop + ' not found in MW API response!'
+                    status: 400,
+                    type: 'invalid_last_event_id',
+                    title: 'Invalid last-event-id',
+                    detail: 'last-event-id header could not be parsed as JSON: ' + e.message,
+                    last_event_id: req.headers['last-event-id'],
                 });
             }
-            // ok, return that prop
-            var ret = {};
-            ret[req.params.prop] = apiRes.body.query.general[req.params.prop];
-            res.status(200).json(ret);
-            return;
         }
-        // set the response code as returned by the MW API
-        // and return the whole response (contained in body.query.general)
-        res.status(200).json(apiRes.body.query.general);
-    });
 
-});
+        // Otherwise build assignemnts from topics param, starting at latest.
+        else {
+            assignments = kafkaUtils.buildAssignments(
+                kafkaConsumer._metadata.topics,
+                req.params.topics.split(',')
+            );
+        }
 
+        // Validate the assignments we got from the client.
+        try {
+            kafkaUtils.validateAssignments(assignments);
+        }
+        catch (e) {
+            throw new HTTPError({
+                status: 400,
+                type: 'invalid_assignments',
+                title: 'Invalid Topic Partition Offset Assignments',
+                detail: 'Assignments via topics or last-event-id is invalid: ' + e.message,
+                assignments: assignments,
+            });
+        }
 
-/****************************
- *  PAGE MASSAGING SECTION  *
- ****************************/
+        return assignments;
+    })
+    // Assign to kafka consumer and init sseClient
+    .then((assignments) => {
 
-/**
- * A helper function that obtains the Parsoid HTML for a given title and
- * loads it into a domino DOM document instance.
- *
- * @param {String} domain the domain to contact
- * @param {String} title the title of the page to get
- * @return {Promise} a promise resolving as the HTML element object
- */
-function getBody(domain, title) {
+        // initialize the latestOffsetsMap with assignments.
+        // The client will be sent latest offsets as assignments
+        // as the SSE id for each message.
+        assignments.forEach((a) => {
+            latestOffsetsMap[`${a.topic}/${a.partition}`] = a;
+        });
 
-    // get the page
-    return apiUtil.restApiGet(app, domain, 'page/html/' + title)
-    .then(function(callRes) {
-        // and then load and parse the page
-        return BBPromise.resolve(domino.createDocument(callRes.body));
-    });
+        // Assign the kafkaConsumer to consume at provided assignments.
+        req.logger.log('info/eventstreams', { message: 'Assigning KafkaConsumer', assignments: assignments });
+        kafkaConsumer.assign(assignments);
+    })
+    // Initialize the sseClient and return a function that uses the connected
+    // sse client to send events.
+    .then(() => {
+        // ini
+        const sseClient = new sse.Client(req, res);
+        sseClient.initialize();
 
-}
-
-
-/**
- * GET /page/{title}
- * Gets the body of a given page.
- */
-router.get('/page/:title', function(req, res) {
-
-    // get the page's HTML directly
-    return getBody(req.params.domain, req.params.title)
-    // and then return it
-    .then(function(doc) {
-        res.status(200).type('html').end(doc.body.innerHTML);
-    });
-
-});
-
-
-/**
- * GET /page/{title}/lead
- * Gets the leading section of a given page.
- */
-router.get('/page/:title/lead', function(req, res) {
-
-    // get the page's HTML directly
-    return getBody(req.params.domain, req.params.title)
-    // and then find the leading section and return it
-    .then(function(doc) {
-        var leadSec = '';
-        // find all paragraphs directly under the content div
-        var ps = doc.querySelectorAll('p') || [];
-        for(var idx = 0; idx < ps.length; idx++) {
-            var child = ps[idx];
-            // find the first paragraph that is not empty
-            if(!/^\s*$/.test(child.innerHTML) ) {
-                // that must be our leading section
-                // so enclose it in a <div>
-                leadSec = '<div id="lead_section">' + child.innerHTML + '</div>';
-                break;
+        /**
+         * Handles JSON stringifying message and id, and then
+         * sends an event to sseClient;
+         */
+        function sseSend(event, message, id) {
+            if (!_.isString(message)) {
+                message = JSON.stringify(message);
             }
-        }
-        res.status(200).type('html').end(leadSec);
-    });
+            if (!_.isString(id)) {
+                id = JSON.stringify(id);
+            }
 
+            return sseClient.send(event, message, id);
+        }
+
+        return sseSend;
+    })
+
+    // Then create a callback function that sends errors and messages to
+    // the connected sseClient.  This callback function will be called
+    // by the kafka consume loop for every consumed message or error.
+    .then(sseSend => {
+        function sseSendCb(error, message) {
+            if (error) {
+                req.logger.log('error/eventstreams', error);
+                return sseSend('error', error.message, _.values(latestOffsetsMap));
+            }
+            else {
+                // TODO: this forces us to make deserializer have the message contain a _kafka
+                // property.  How can we extract the offset information transparently here???
+
+                // Add this message's id to latestOffsetsMap object
+                latestOffsetsMap[`${message._kafka.topic}/${message._kafka.partition}`] = message._kafka;
+                return sseSend('message', message, _.values(latestOffsetsMap));
+            }
+        };
+
+        return sseSendCb;
+    })
+
+    // Then enter the kafka consume loop, calling the function that sends messages
+    // and errors to SSE clients for every consumed message.
+    .then(sseSendCb => {
+        // TODO: pass in configurable deserializer and matcher functions?
+        return kafkaUtils.consumeLoop(kafkaConsumer, undefined, undefined, sseSendCb);
+    });
 });
 
 
 module.exports = function(appObj) {
-
     app = appObj;
 
     return {
-        path: '/',
+        path: '/v1',
         api_version: 1,
+        skip_domain: true,
         router: router
     };
-
 };
 

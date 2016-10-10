@@ -39,5 +39,8 @@ services:
       spec: ./spec.template.yaml
       # allow cross-domain requests to the API (default '*')
       cors: '*'
-      # kafka configs go here.
-      # kafka:
+      # Any rdkafka KafkaConsumer configs can go here.
+      # enable.auto.commit cannot be overridden, and is
+      # always false.
+      kafka:
+        metadata.broker.list: 'localhost:9092'
