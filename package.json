@@ -1,5 +1,5 @@
 {
-  "name": "service-template-node",
+  "name": "eventstreams",
   "version": "0.4.1",
   "description": "A blueprint for MediaWiki REST API services",
   "main": "./app.js",
@@ -40,9 +40,7 @@
     "preq": "^0.4.10",
     "service-runner": "^2.0.4",
     "swagger-router": "^0.4.6",
-    "node-rdkafka": "^0.5.4",
-    "lodash": "^4.15.0",
-    "sse": "^0.0.6"
+    "kafka-sse": "file:../kafka-sse"
   },
   "devDependencies": {
     "extend": "^3.0.0",
